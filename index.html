@@ -503,90 +503,118 @@ function fitText(s, size, bold, maxW, sp = 0){
   return s + "…";
 }
 
-function layoutPage(g, sets, o){
-  const land = o.land, W = land ? 842 : 595, H = land ? 595 : 842, M = 26, fs = o.fs;
+// Querformat A4. Jedes Set bleibt geschlossen in EINER Spalte. Sets stehen nebeneinander;
+// ab 3 Sets dürfen mehrere Sets in einer Spalte untereinander stehen (mit Trennlinie).
+const PAGE = { W: 842, H: 595, M: 26, bandH: 76, gap: 18 };
+function metrics(sets, fs, cols){
+  const { W, M, gap } = PAGE;
+  const colW = (W - 2 * M - gap * (cols - 1)) / cols;
+  const m = { fs, colW, headH: fs * 1.75, headGap: fs * .35, pad: fs * .44, lineH: fs * 1.2, sepGap: fs * 2.2, posW: fs * 1.55 };
+  m.nrW = Math.max(fs * 1.6, ...sets.flatMap(s => s.items.map(it => tw(it.nr, fs, true)))) + fs * .55;
+  m.titleW = colW - m.posW - m.nrW - fs * .4;
+  if (m.titleW < fs * 5) return null;
+  m.rows = sets.map(s => s.items.map(it => { const L = wrap(it.title, fs, false, m.titleW); return { it, L, h: L.length * m.lineH + m.pad }; }));
+  m.heights = m.rows.map(R => m.headH + m.headGap + R.reduce((a, r) => a + r.h, 0));
+  return m;
+}
+// Sets der Reihe nach auf Spalten verteilen, sodass die längste Spalte möglichst kurz ist
+function partition(h, cols, sep){
+  const n = h.length, memo = new Map();
+  const colH = (i, j) => { let t = 0; for (let k = i; k < j; k++) t += h[k] + (k > i ? sep : 0); return t; };
+  const go = (i, c) => {
+    const key = i + "|" + c; if (memo.has(key)) return memo.get(key);
+    let best;
+    if (c === 1) best = { max: colH(i, n), cuts: [n] };
+    else for (let j = i + 1; j <= n - c + 1; j++){
+      const rest = go(j, c - 1), max = Math.max(colH(i, j), rest.max);
+      if (!best || max < best.max) best = { max, cuts: [j, ...rest.cuts] };
+    }
+    memo.set(key, best); return best;
+  };
+  const r = go(0, cols); const groups = []; let i = 0;
+  for (const j of r.cuts){ groups.push(Array.from({ length: j - i }, (_, k) => i + k)); i = j; }
+  return { max: r.max, groups };
+}
+const bodyTop = () => PAGE.bandH + 3 + 18, bodyH = () => PAGE.H - PAGE.M - bodyTop();
+function tryFit(sets, fs, cols){
+  const m = metrics(sets, fs, cols); if (!m) return null;
+  const p = partition(m.heights, cols, m.sepGap);
+  return p.max <= bodyH() ? { m, groups: p.groups } : null;
+}
+function layoutPage(g, sets, fit){
+  const { W, H, M, bandH, gap } = PAGE, { m, groups } = fit, fs = m.fs;
   const ops = [], T = (x, y, s, size, bold, c, align = "left", sp = 0) => {
     const w = tw(s, size, bold, sp); if (align === "right") x -= w; else if (align === "center") x -= w / 2;
     ops.push({ t: "text", x, y, s, size, bold, c, sp });
   };
   // Kopfbereich: schwarzes Band mit Logo
-  const bandH = land ? 76 : 88, logo = bandH - 16;
+  const logo = bandH - 16;
   ops.push({ t: "rect", x: 0, y: 0, w: W, h: bandH, c: "#0b0b0b" });
   ops.push({ t: "img", x: M - 4, y: 8, w: logo, h: logo });
   const tx = M - 4 + logo + 14, tmax = W - tx - M;
-  let tsize = land ? 24 : 22; const title = g.name.toUpperCase();
+  let tsize = 24; const title = g.name.toUpperCase();
   while (tsize > 12 && tw(title, tsize, true, tsize * .06) > tmax) tsize -= .5;
   T(tx, bandH / 2 + 2, fitText(title, tsize, true, tmax, tsize * .06), tsize, true, "#ffffff", "left", tsize * .06);
   const total = sets.reduce((a, s) => a + s.items.length, 0);
   const sub = `${sets.length} SET${sets.length === 1 ? "" : "S"}  ·  ${total} STÜCKE`;
-  T(tx, bandH / 2 + 2 + 17, sub, 9, true, "#ff3350", "left", 1.3);
-  T(tx + tw(sub, 9, true, 1.3) + 12, bandH / 2 + 2 + 17, "Stand " + new Date().toLocaleDateString("de-DE"), 8.5, false, "#9b9090");
+  T(tx, bandH / 2 + 19, sub, 9, true, "#ff3350", "left", 1.3);
+  T(tx + tw(sub, 9, true, 1.3) + 12, bandH / 2 + 19, "Stand " + new Date().toLocaleDateString("de-DE"), 8.5, false, "#9b9090");
   ops.push({ t: "rect", x: 0, y: bandH, w: W, h: 3, c: RED });
 
-  // Spalten
-  const top = bandH + 3 + 18, bottom = H - M, gap = 16, cols = o.cols;
-  const colW = (W - 2 * M - gap * (cols - 1)) / cols;
-  const headH = fs * 1.75, headGap = fs * .35, pad = fs * .44, lineH = fs * 1.2, setGap = fs * 1.15;
-  const posW = fs * 1.55;
-  const nrW = Math.max(fs * 1.6, ...sets.flatMap(s => s.items.map(it => tw(it.nr, fs, true)))) + fs * .55;
-  const titleW = colW - posW - nrW - fs * .4;
-  if (titleW < fs * 5) return { ok: false };
-  let col = 0, y = top, maxY = top;
-  const cx = () => M + col * (colW + gap);
-  const header = (s, cont) => {
-    const x = cx();
-    ops.push({ t: "rect", x, y, w: colW, h: headH, c: RED });
-    ops.push({ t: "rect", x, y, w: fs * .22, h: headH, c: "#8a0a1d" });
-    const name = s.name.toUpperCase(), nw = tw(name, fs * .95, true, fs * .07), avail = colW - fs * 1.8;
-    let right = cont ? "Fortsetzung" : `${s.items.length} Stücke`;
-    if (nw + tw(right, fs * .66, false) > avail) right = cont ? "Forts." : String(s.items.length);
-    const rw = tw(right, fs * .66, false);
-    T(x + fs * .65, y + headH * .5 + fs * .33, fitText(name, fs * .95, true, avail - rw, fs * .07), fs * .95, true, "#ffffff", "left", fs * .07);
-    T(x + colW - fs * .55, y + headH * .5 + fs * .24, right, fs * .66, false, "#ffd6dc", "right");
-    y += headH + headGap;
-  };
-  const rows = sets.map(s => s.items.map(it => { const L = wrap(it.title, fs, false, titleW); return { it, L, h: L.length * lineH + pad }; }));
-  const nextCol = () => { col++; y = top; return col < cols; };
-  for (let k = 0; k < sets.length; k++){
-    const s = sets[k], R = rows[k];
-    if (k > 0){
-      if (o.split){ if (!nextCol()) return { ok: false }; }
-      else y += setGap;
-    }
-    const need = headH + headGap + R.slice(0, 2).reduce((a, r) => a + r.h, 0);
-    if (y + need > bottom && y > top && !nextCol()) return { ok: false };
-    header(s, false);
-    R.forEach((r, i) => {
-      if (y + r.h > bottom){ if (!nextCol()) throw 0; header(s, true); }
-      const x = cx();
-      if (i % 2 === 1) ops.push({ t: "rect", x, y, w: colW, h: r.h, c: "#f3f0f0" });
-      const base = y + pad / 2 + fs * .86;
-      T(x + posW - fs * .3, base, (i + 1) + ".", fs * .62, false, "#9a9a9a", "right");
-      T(x + posW + nrW - fs * .45, base, r.it.nr, fs, true, RED, "right");
-      r.L.forEach((l, j) => T(x + posW + nrW, base + j * lineH, l, fs, false, "#141414"));
-      y += r.h; maxY = Math.max(maxY, y);
-    });
-  }
-  return { ok: true, ops, W, H, fs, fill: maxY };
-}
-function safeLayout(g, sets, o){ try { return layoutPage(g, sets, o); } catch { return { ok: false }; } }
-function bestLayout(g, sets){
-  let best = null;
-  for (const land of [false, true]){
-    for (let cols = 1; cols <= Math.min(land ? 5 : 4, Math.max(sets.length, 3)); cols++){
-      for (const split of sets.length === cols ? [true, false] : [false]){
-        let lo = 4, hi = 26, okL = null;
-        for (let k = 0; k < 11; k++){
-          const mid = (lo + hi) / 2, L = safeLayout(g, sets, { land, cols, split, fs: mid });
-          if (L.ok){ lo = mid; okL = L; } else hi = mid;
-        }
-        if (okL && (!best || okL.fs > best.fs + .25)) best = okL;
+  const top = bodyTop(), colW = m.colW;
+  groups.forEach((grp, c) => {
+    const x = M + c * (colW + gap);
+    if (c > 0) ops.push({ t: "rect", x: x - gap / 2 - .4, y: top, w: .8, h: H - M - top, c: "#dddddd" });  // feine Spaltenlinie
+    let y = top;
+    grp.forEach((k, j) => {
+      const s = sets[k], R = m.rows[k];
+      if (j > 0){ // Trennung zum Set darüber
+        ops.push({ t: "rect", x, y: y + m.sepGap / 2 - 1, w: colW, h: 2, c: "#111111" });
+        y += m.sepGap;
       }
-    }
-  }
-  return best;
+      // Set-Kopf
+      const headH = m.headH, name = s.name.toUpperCase(), avail = colW - fs * 1.8;
+      let right = `${s.items.length} Stücke`;
+      if (tw(name, fs * .95, true, fs * .07) + tw(right, fs * .66, false) > avail) right = String(s.items.length);
+      const rw = tw(right, fs * .66, false);
+      ops.push({ t: "rect", x, y, w: colW, h: headH, c: RED });
+      ops.push({ t: "rect", x, y, w: fs * .22, h: headH, c: "#8a0a1d" });
+      T(x + fs * .65, y + headH * .5 + fs * .33, fitText(name, fs * .95, true, avail - rw, fs * .07), fs * .95, true, "#ffffff", "left", fs * .07);
+      T(x + colW - fs * .55, y + headH * .5 + fs * .24, right, fs * .66, false, "#ffd6dc", "right");
+      y += headH + m.headGap;
+      R.forEach((r, i) => {
+        if (i % 2 === 1) ops.push({ t: "rect", x, y, w: colW, h: r.h, c: "#f3f0f0" });
+        const base = y + m.pad / 2 + fs * .86;
+        T(x + m.posW - fs * .3, base, (i + 1) + ".", fs * .62, false, "#9a9a9a", "right");
+        T(x + m.posW + m.nrW - fs * .45, base, r.it.nr, fs, true, RED, "right");
+        r.L.forEach((l, jj) => T(x + m.posW + m.nrW, base + jj * m.lineH, l, fs, false, "#141414"));
+        y += r.h;
+      });
+    });
+  });
+  return { ok: true, ops, W, H, fs, groups };
 }
-
+function bestLayout(g, sets){
+  const n = sets.length, cand = [];
+  // nebeneinander (eine Spalte je Set); ab 3 Sets auch weniger Spalten mit Sets untereinander
+  for (let cols = n; cols >= (n >= 3 ? 2 : n); cols--){
+    let lo = 3, hi = 26, fit = null;
+    for (let k = 0; k < 12; k++){ const mid = (lo + hi) / 2, f = tryFit(sets, mid, cols); if (f){ lo = mid; fit = f; } else hi = mid; }
+    if (!fit){ const f = tryFit(sets, 3, cols); if (f) fit = f; }
+    if (fit) cand.push({ cols, fit });
+  }
+  if (!cand.length) return null;
+  // Bewertung: große Schrift ist gut, umbrochene oder getrennte Titel sind schlecht
+  cand.forEach(c => {
+    const all = c.fit.m.rows.flat(), wrapped = all.filter(r => r.L.length > 1).length / Math.max(1, all.length);
+    const hyph = all.filter(r => r.L.some(l => l.endsWith("-") && !r.it.title.includes(l))).length / Math.max(1, all.length);
+    c.score = c.fit.m.fs * (1 - .55 * wrapped - 1.2 * hyph);
+  });
+  // Nebeneinander bevorzugen; Untereinander nur, wenn es klar besser lesbar ist (≥ 10 %)
+  let best = cand[0];
+  for (const c of cand.slice(1)) if (c.score >= best.score * 1.10) best = c;
+  return layoutPage(g, sets, best.fit);
+}
 /* ---------- Zeichnen auf Canvas (Vorschau / Bild) ---------- */
 let logoImg = null;
 function loadLogo(){ return logoImg ? Promise.resolve(logoImg) : new Promise(r => { const i = new Image(); i.onload = () => { logoImg = i; r(i); }; i.onerror = () => r(null); i.src = LOGO; }); }
